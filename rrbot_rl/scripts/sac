@@ -1,0 +1,401 @@
+#!/usr/bin/env python
+
+import copy
+import os
+import numpy as np
+import random
+import time
+import sys
+from collections import deque
+
+from numpy.lib.type_check import real_if_close
+
+
+from environment import Env
+from utils.onu_noise import OUNoise
+from utils.function import soft_update, hard_update
+
+import torch.nn as nn
+import torch.nn.functional as F
+import torch
+
+from std_msgs.msg import Float32
+import rospy
+
+sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
+
+
+#---Directory Path---#
+dirPath = os.path.dirname(os.path.realpath(__file__))
+
+
+#---Run agent---#
+
+is_training = True
+
+exploration_decay_rate = 0.001
+
+MAX_EPISODES = 10001
+MAX_STEPS = 750
+MAX_BUFFER = 200000
+rewards_all_episodes = []
+
+STATE_DIMENSION = 5
+ACTION_DIMENSION = 2
+q1_VMAX = 1.  # m/s
+q2_VMAX = 0.5  # rad/s
+
+
+BATCH_SIZE = 100
+LEARNING_RATE = 0.0003
+GAMMA = 0.99
+TAU = 0.001
+
+x = 0
+y = 0
+z = 0
+th = 0
+status = 0
+key_timeout = None
+speed = None
+repeat = None
+turn = None
+
+#---Critic--#
+
+EPS = 0.003
+
+
+class Critic(nn.Module):
+    def __init__(self, state_dim, action_dim):
+        super(Critic, self).__init__()
+
+        self.state_dim = state_dim = state_dim
+        self.action_dim = action_dim
+
+        self.fc1 = nn.Linear(state_dim, 75)
+        nn.init.xavier_uniform_(self.fc1.weight)
+        self.fc1.bias.data.fill_(0.01)
+        # self.fc1.weight.data = fanin_init(self.fc1.weight.data.size())
+
+        self.fa1 = nn.Linear(action_dim, 75)
+        nn.init.xavier_uniform_(self.fa1.weight)
+        self.fa1.bias.data.fill_(0.01)
+        # self.fa1.weight.data = fanin_init(self.fa1.weight.data.size())
+
+        self.fca1 = nn.Linear(75, 108)
+        nn.init.xavier_uniform_(self.fca1.weight)
+        self.fca1.bias.data.fill_(0.01)
+        # self.fca1.weight.data = fanin_init(self.fca1.weight.data.size())
+
+        self.fca2 = nn.Linear(108, 1)
+        nn.init.xavier_uniform_(self.fca2.weight)
+        self.fca2.bias.data.fill_(0.01)
+        # self.fca2.weight.data.uniform_(-EPS, EPS)
+
+    def forward(self, state, action):
+        xs = torch.relu(self.fc1(state))
+        # xa = torch.relu(self.fa1(action))
+        # x = torch.cat((xs,xa), dim=1)
+        x = torch.relu(self.fca1(xs))
+        vs = self.fca2(x)
+        return vs
+
+#---Actor---#
+
+
+class Actor(nn.Module):
+    def __init__(self, state_dim, action_dim, q1_vel, q2_vel):
+        super(Actor, self).__init__()
+        self.state_dim = state_dim = state_dim
+        self.action_dim = action_dim
+        self.q1_vel = q1_vel
+        self.q2_vel = q2_vel
+        self.action = torch.empty(action_dim)
+
+        self.fa1 = nn.Linear(state_dim, 75)
+        nn.init.xavier_uniform_(self.fa1.weight)
+        self.fa1.bias.data.fill_(0.01)
+        # self.fa1.weight.data = fanin_init(self.fa1.weight.data.size())
+
+        self.fa2 = nn.Linear(75, 25)
+        nn.init.xavier_uniform_(self.fa2.weight)
+        self.fa2.bias.data.fill_(0.01)
+        # self.fa2.weight.data = fanin_init(self.fa2.weight.data.size())
+
+        self.fa3 = nn.Linear(25, action_dim)
+        nn.init.xavier_uniform_(self.fa3.weight)
+        self.fa3.bias.data.fill_(0.01)
+        # self.fa3.weight.data.uniform_(-EPS,EPS)
+
+    def forward(self, state):
+        x = torch.relu(self.fa1(state))
+        x = torch.relu(self.fa2(x))
+        action = self.fa3(x)
+        #nprint (action)
+        try:
+            if state.shape <= torch.Size([self.state_dim]):
+                action[0] = torch.sigmoid(action[0])*self.q1_vel
+                action[1] = torch.tanh(action[1])*self.q2_vel
+
+            else:
+                action[:, 0] = torch.sigmoid(action[:, 0])*self.q1_vel
+                action[:, 1] = torch.tanh(action[:, 1])*self.q2_vel
+
+        except Exception as e:
+            pass
+        # print (action)
+        return torch.max(action)
+
+#---Memory Buffer---#
+
+
+class MemoryBuffer:
+    def __init__(self, size):
+        self.buffer = deque(maxlen=size)
+        self.maxSize = size
+        self.len = 0
+
+    def sample(self, count):
+        batch = []
+        count = min(count, self.len)
+        batch = random.sample(self.buffer, count)
+
+        s_array = np.float32([array[0] for array in batch])
+        a_array = np.float32([array[1] for array in batch])
+        r_array = np.float32([array[2] for array in batch])
+        new_s_array = np.float32([array[3] for array in batch])
+        done_array = np.float32([array[4] for array in batch])
+
+        return s_array, a_array, r_array, new_s_array, done_array
+
+    def len(self):
+        return self.len
+
+    def add(self, s, a, r, new_s, done):
+        transition = (s, a, r, new_s, done)
+        self.len += 1
+        if self.len > self.maxSize:
+            self.len = self.maxSize
+        self.buffer.append(transition)
+
+
+class Trainer:
+
+    def __init__(self, state_dim, action_dim, q1_vel, q2_vel, ram):
+        self.dirPath = os.path.dirname(os.path.realpath(__file__))
+        self.dirPath = self.dirPath.replace(
+            'rrbot_rl/scripts', 'rrbot_rl/models/model_')
+
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.q1_vel = q1_vel
+        self.q2_vel = q2_vel
+        # print('w',self.q2_vel)
+        self.ram = ram
+        #self.iter = 0
+
+        self.actor = Actor(self.state_dim, self.action_dim,
+                           self.q1_vel, self.q2_vel)
+        self.target_actor = Actor(
+            self.state_dim, self.action_dim, self.q1_vel, self.q2_vel)
+        self.actor_optimizer = torch.optim.Adam(
+            self.actor.parameters(), LEARNING_RATE)
+
+        self.critic = Critic(self.state_dim, self.action_dim)
+        self.target_critic = Critic(self.state_dim, self.action_dim)
+        self.critic_optimizer = torch.optim.Adam(
+            self.critic.parameters(), LEARNING_RATE)
+        self.pub_qvalue = rospy.Publisher('qvalue', Float32, queue_size=5)
+        self.qvalue = Float32()
+
+        hard_update(self.target_actor, self.actor)
+        hard_update(self.target_critic, self.critic)
+
+        self.noise = OUNoise(ACTION_DIMENSION, max_sigma=0.1,
+                             min_sigma=0.1, decay_period=8000000)
+
+    def get_exploitation_action(self, state):
+        state = torch.from_numpy(state)
+        action = self.actor.forward(state).detach()
+        #print('actionploi', action)
+        return action.data.numpy()
+
+    def get_exploration_action(self, state):
+        state = torch.from_numpy(state)
+        action = self.actor.forward(state).detach()
+        noise = self.noise.get_noise()
+        # print('noisea', noise)
+        noise[0] = noise[0]*self.q1_vel
+        noise[1] = noise[1]*self.q2_vel
+        # print('noise', noise)
+        new_action = action.data.numpy() + noise
+        #print('action_no', new_action)
+        return new_action
+
+    def optimizer(self):
+        s_sample, a_sample, r_sample, new_s_sample, done_sample = ram.sample(
+            BATCH_SIZE)
+
+        s_sample = torch.from_numpy(s_sample)
+        a_sample = torch.from_numpy(a_sample)
+        r_sample = torch.from_numpy(r_sample)
+        new_s_sample = torch.from_numpy(new_s_sample)
+        done_sample = torch.from_numpy(done_sample)
+
+        # -------------- optimize critic
+
+        a_target = self.target_actor.forward(new_s_sample).detach()
+        next_value = torch.squeeze(
+            self.target_critic.forward(new_s_sample, a_target).detach())
+        # y_exp = r _ gamma*Q'(s', P'(s'))
+        y_expected = r_sample + (1 - done_sample)*GAMMA*next_value
+        # y_pred = Q(s,a)
+        y_predicted = torch.squeeze(self.critic.forward(s_sample, a_sample))
+        # -------Publisher of Vs------
+        self.qvalue = y_predicted.detach()
+        # print (self.qvalue)
+        self.pub_qvalue.publish(torch.max(self.qvalue))
+        #print(self.qvalue, torch.max(self.qvalue))
+        # ----------------------------
+        loss_critic = F.smooth_l1_loss(y_predicted, y_expected)
+
+        self.critic_optimizer.zero_grad()
+        loss_critic.backward()
+        self.critic_optimizer.step()
+
+        pred_a_sample = self.actor.forward(s_sample)
+        loss_actor = -1*torch.sum(self.critic.forward(s_sample, pred_a_sample))
+
+        self.actor_optimizer.zero_grad()
+        loss_actor.backward()
+        self.actor_optimizer.step()
+
+        soft_update(self.target_actor, self.actor, TAU)
+        soft_update(self.target_critic, self.critic, TAU)
+
+    def get_qvalue(self):
+        try:
+            return torch.max(self.qvalue)
+        except Exception as e:
+            return np.max(self.qvalue.data)
+
+    def save_models(self, episode_count):
+        torch.save(self.target_actor.state_dict(), self.dirPath +
+                   "{}_actor.pt".format(episode_count))
+        torch.save(self.target_critic.state_dict(), self.dirPath +
+                   "{}_critic.pt".format(episode_count))
+        rospy.loginfo("MODEL SAVED!!")
+
+    def load_models(self, episode):
+        self.actor.load_state_dict(torch.load(
+            self.dirPath + "{}_actor.pt".format(episode)))
+        self.critic.load_state_dict(torch.load(
+            self.dirPath + "{}_critic.pt".format(episode)))
+        hard_update(self.target_actor, self.actor)
+        hard_update(self.target_critic, self.critic)
+        rospy.loginfo("MODEL HAS BEEN LOADED!!!")
+
+
+print('State Dimensions: ' + str(STATE_DIMENSION))
+print('Action Dimensions: ' + str(ACTION_DIMENSION))
+
+ram = MemoryBuffer(MAX_BUFFER)
+trainer = Trainer(STATE_DIMENSION, ACTION_DIMENSION,
+                  q1_VMAX, q2_VMAX, ram)
+noise = OUNoise(ACTION_DIMENSION, max_sigma=0.1,
+                min_sigma=0.1, decay_period=8000000)
+# trainer.load_models(560)
+
+if __name__ == '__main__':
+    rospy.init_node('sac_rrbot_trainer')
+    pub_result = rospy.Publisher('result', Float32, queue_size=5)
+    result = Float32()
+    env = Env(ACTION_DIMENSION, q1_VMAX, q2_VMAX)
+    before_training = 4
+
+    past_action = np.zeros(ACTION_DIMENSION)
+    rewards_current_episode = 0.
+
+    start_time = time.time()
+
+    if is_training:
+        print('-'*100)
+        rospy.loginfo("STARTED TRAINING PROCESS!!!")
+        print('-'*100)
+
+    for ep in range(1, MAX_EPISODES):
+        done = False
+        state = env.reset()
+
+        for step in range(MAX_STEPS):
+            state = np.float32(state)
+
+            # if is_training and not ep%10 == 0 and ram.len >= before_training*MAX_STEPS:
+            if is_training:
+                action = trainer.get_exploration_action(state)
+            else:
+                action = trainer.get_exploitation_action(state)
+
+            next_state, reward, done = env.step(action)
+            # print('action', action,'r',reward)
+            past_action = copy.deepcopy(action)
+
+            rewards_current_episode += reward
+            next_state = np.float32(next_state)
+
+            # Verbose
+            if not ep % 10 == 0 or not ram.len >= before_training*MAX_STEPS:
+                if reward == 500.:
+                    print('***\n-------- Maximum Reward ----------\n****')
+                    for _ in range(3):
+                        ram.add(state, action, reward, next_state, done)
+                else:
+                    ram.add(state, action, reward, next_state, done)
+            state = copy.deepcopy(next_state)
+
+            if is_training and ep % 10 == 0:
+                # rospy.loginfo("Models Updated")
+                trainer.optimizer()
+
+            # print(step)
+
+            if step > 500:
+                done = True
+
+            if done or env.success:  # step == MAX_STEPS-1:
+
+                m, s = divmod(int(time.time() - start_time), 60)
+                h, m = divmod(m, 60)
+                print('-'*100)
+                rospy.loginfo("SAC MODEL FOR RRBOT!!!")
+
+                rospy.loginfo('Ep: %d Q value: %.2f Reward %.2f time: %d:%02d:%02d',
+                              ep, trainer.get_qvalue(), float(rewards_current_episode), h, m, s)
+
+                if step > 500:
+                    rospy.loginfo("TIME OUT!!!")
+
+                if env.box_thrown:
+                    rospy.loginfo("BOX THROWN!! RESETTING")
+                    # env.respawner.softRespawnModel()
+
+                elif env.success and done:
+                    rospy.loginfo("GOAL REACHED!!!")
+                    # env.reset()
+
+                result = rewards_current_episode
+                qvalue = trainer.get_qvalue().data
+                score = Float32()
+                score.data = result
+                pub_result.publish(score)
+
+                if done or env.box_thrown:
+                    break
+
+            rospy.sleep(0.2)
+
+        if ep % 200 == 0:
+            trainer.save_models(ep)
+
+    print('Completed Training')

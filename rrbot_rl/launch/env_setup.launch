@@ -1,0 +1,11 @@
+<!-- Start the environment with the appropriate controls -->
+<launch>
+    <include file="$(find rrbot_rl)/launch/rrbot_world.launch" />
+
+    <include file="$(find rrbot_control)/launch/rrbot_control.launch" />
+
+    <node name="result_plot" type="result_plot" pkg="rrbot_rl" output="screen" />
+    
+    <!--node name="image_viewer" pkg="image_view" type="image_view" output="screen" 
+        args="image:=/rrbot/camera1/image_raw" /-->
+</launch>
