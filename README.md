@@ -43,10 +43,10 @@ source <workspace>/devel/setup.bash
 roslaunch rrbot_rl env_setup.launch
 ```
 
- - To start the training process, in directory (from workspace) `src/rrbot_rl/rrbot_rl/scripts`
+ - To start the training process run,
 
 ```
-python sac
+python src/rrbot_rl/rrbot_rl/scripts/sac
 ```
 
 ## Test
