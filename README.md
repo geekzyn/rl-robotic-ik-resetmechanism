@@ -1,6 +1,10 @@
 # Deep Reinforcement Learning - An Inverse Kinematic Approach to the Reset Mechanism
 This repository contains the implementation for an IK definition of the reset mechanism in a RL-framework. The 2R robotic arm manipulator learns to move a cuboid to a goal position (pulling cuboid towards the end of the table). Instead of an instant reset of the environment at the end of an episode, the robotic arm will use IK and trajectory planning to put the cuboid back to its initial position. The implementation is tested in ROS Noetic\Melodic and the algorithm used for training the robot is Soft Actor Critic (SAC).
 
+<img src="https://github.com/geekzyn/rl-robotic-ik-resetmechanism/blob/master/results/animated_resetmechanism.gif" width="480" height="232"> <img src="https://github.com/geekzyn/rl-robotic-ik-resetmechanism/blob/master/results/animated_resetmechanism2.gif" width="400" height="232">
+
+
+
 ## Installation
 
  - First, start by cloning the repository into a ROS workspace. For example `robot_ws/src`
